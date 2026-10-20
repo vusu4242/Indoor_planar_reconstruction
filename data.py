@@ -20,7 +20,7 @@ import re
 import cv2
 import numpy as np
 
-ROOT = "/content/drive/MyDrive/AI project/dataset"
+ROOT = "/content/drive/MyDrive/AI project/dataset_scene_00"
 
 _NAME = re.compile(r"^(scene_\d+)_(room\d+)_(view\d+)$")
 
