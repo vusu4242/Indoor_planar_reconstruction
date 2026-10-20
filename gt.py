@@ -53,15 +53,24 @@ def plane_params(p):
     return (-n, -d) if d < 0 else (n, d)
 
 
-def gt_frame(f, tol_mm=20, tol_rel=0.01):
-    """Остаточний GT кадру: маска видимих площин, параметри площин, GT-точки."""
+def gt_frame(f, tol_mm=20, tol_rel=0.01, use_semantic=False):
+    """Остаточний GT кадру: маска видимих площин, параметри площин, GT-точки.
+
+    use_semantic=False — піксель належить площині, якщо лежить на ній геометрично
+                         (жалюзі, рами, картини впритул до стіни теж рахуються стіною);
+    use_semantic=True  — ще й семантика має бути «стіна/підлога/стеля» відповідно
+                         до типу площини (вікна, жалюзі, двері, картини відкидаються)."""
     pmask, planes = plane_gt(f)
     P = data.backproject(f["depth"], f["cam"]["K"])
     valid = f["depth"] > 0
     tol = np.maximum(tol_mm, tol_rel * f["depth"])
+    cls = semantic_classes(f) if use_semantic else None
     vis = np.zeros_like(pmask)
     for p in planes:
         p["n"], p["d"] = plane_params(p)
         on_plane = np.abs(P @ p["n"] + p["d"]) < tol
-        vis[(pmask == p["label"]) & valid & on_plane] = p["label"]
+        keep = (pmask == p["label"]) & valid & on_plane
+        if use_semantic:
+            keep &= cls == TYPE_ID.get(p["type"], -1)
+        vis[keep] = p["label"]
     return {"mask": vis, "planes": planes, "points": P, "valid": valid}
