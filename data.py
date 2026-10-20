@@ -20,7 +20,7 @@ import re
 import cv2
 import numpy as np
 
-ROOT = "/content/drive/MyDrive/AI project/dataset_scene_00"
+ROOT = "/content/drive/MyDrive/AI project/dataset"
 
 _NAME = re.compile(r"^(scene_\d+)_(room\d+)_(view\d+)$")
 
@@ -40,25 +40,74 @@ def frame_path(name, kind):
     return os.path.join(frame_dir(name), ext)
 
 
-def list_frames():
-    """Назви всіх кадрів (папки, де є rgb.png)."""
+INDEX_FILE = "index.txt"     # список усіх кадрів, щоб не обходити Drive щоразу
+_FRAMES = None               # список кадрів у пам'яті (на час сесії)
+
+
+def _sort(names):
+    """Сортування: за кімнатою, потім за номером ракурсу як числом (view2 < view10)."""
+    return sorted(set(names), key=lambda n: (n.rsplit("_view", 1)[0], int(n.rsplit("_view", 1)[1])))
+
+
+def _scan(pattern):
+    """Обходить папки за шаблоном і повертає назви кадрів, де є rgb.png."""
     names = []
-    for p in glob.glob(os.path.join(ROOT, "scene_*", "room*", "view*", "rgb.png")):
+    for p in glob.glob(pattern):
         view_dir = os.path.dirname(p)
         room_dir = os.path.dirname(view_dir)
         scene_dir = os.path.dirname(room_dir)
         names.append("_".join(os.path.basename(d) for d in (scene_dir, room_dir, view_dir)))
-    return sorted(names, key=lambda n: (n.rsplit("_view", 1)[0], int(n.rsplit("_view", 1)[1])))
+    return names
 
 
-def list_rooms():
-    """Назви кімнат: scene_xxxxx_roomyyyy."""
-    return sorted({n.rsplit("_view", 1)[0] for n in list_frames()})
+def list_frames(scenes=None, refresh=False):
+    """Назви кадрів.
+
+    scenes=None     — усі кадри. Перший раз обходить Drive (повільно) і зберігає
+                      список у ROOT/index.txt; далі читає готовий список (миттєво).
+    scenes=[...]    — лише ці сцени, наприклад ["scene_00000"]; швидко, без index.txt.
+    refresh=True    — обійти Drive заново (якщо додали нові дані) і перезаписати index.txt.
+    """
+    global _FRAMES
+    if scenes is not None:
+        names = []
+        for sc in scenes:
+            names += _scan(os.path.join(ROOT, sc, "room*", "view*", "rgb.png"))
+        return _sort(names)
+
+    if _FRAMES is not None and not refresh:
+        return _FRAMES
+    index = os.path.join(ROOT, INDEX_FILE)
+    if os.path.exists(index) and not refresh:
+        with open(index) as f:
+            _FRAMES = _sort(line.strip() for line in f if line.strip())
+        return _FRAMES
+
+    print("складаю список кадрів (перший раз на Drive це може бути довго)...")
+    _FRAMES = _sort(_scan(os.path.join(ROOT, "scene_*", "room*", "view*", "rgb.png")))
+    try:
+        with open(index, "w") as f:
+            f.write("\n".join(_FRAMES))
+        print(f"готово: {len(_FRAMES)} кадрів, список збережено в {index}")
+    except OSError:
+        print(f"готово: {len(_FRAMES)} кадрів (index.txt зберегти не вдалось — немає прав на запис)")
+    return _FRAMES
+
+
+def list_scenes():
+    """Назви сцен на диску (лише верхній рівень — швидко)."""
+    return sorted(d for d in os.listdir(ROOT) if d.startswith("scene_"))
+
+
+def list_rooms(scenes=None):
+    """Назви кімнат: scene_xxxxx_roomyyyy. scenes — як у list_frames."""
+    return sorted({n.rsplit("_view", 1)[0] for n in list_frames(scenes)})
 
 
 def room_frames(room):
-    """Кадри однієї кімнати (view0, view1, ...)."""
-    return [n for n in list_frames() if n.startswith(room + "_view")]
+    """Кадри однієї кімнати (view0, view1, ...). Дивиться лише в папку цієї кімнати."""
+    scene, rm = room.split("_room")
+    return _sort(_scan(os.path.join(ROOT, scene, "room" + rm, "view*", "rgb.png")))
 
 
 def parse_camera(path, h, w):
