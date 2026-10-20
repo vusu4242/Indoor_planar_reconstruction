@@ -85,6 +85,10 @@ def list_frames(scenes=None, refresh=False):
 
     print("складаю список кадрів (перший раз на Drive це може бути довго)...")
     _FRAMES = _sort(_scan(os.path.join(ROOT, "scene_*", "room*", "view*", "rgb.png")))
+    if not _FRAMES:
+        print("кадрів не знайдено — index.txt не зберігаю (перевірте, чи Colab бачить папки view*)")
+        _FRAMES = None
+        return []
     try:
         with open(index, "w") as f:
             f.write("\n".join(_FRAMES))
