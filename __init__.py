@@ -29,6 +29,7 @@ _ORDER = ["data", "gt", "vggt_model", "ransac", "aggregation", "metrics", "pipel
 def set_root(path):
     """Шлях до папки dataset."""
     data.ROOT = path
+    data._FRAMES = None          # список кадрів іншої папки треба скласти заново
 
 
 def reload():
