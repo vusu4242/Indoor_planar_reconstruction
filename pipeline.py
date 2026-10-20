@@ -111,9 +111,10 @@ def process_room(room, model, conf_pct=30, inframe_merge=True, boundary=True,
     return rows, merge
 
 
-def run_all(model, rooms=None, **kw):
-    """Пайплайн по всіх кімнатах -> (підсумок, таблиця по кадрах, таблиця злиття)."""
-    rooms = rooms or data.list_rooms()
+def run_all(model, rooms=None, scenes=None, **kw):
+    """Пайплайн по кімнатах -> (підсумок, таблиця по кадрах, таблиця злиття).
+    rooms — список кімнат; або scenes — список сцен; якщо нічого не задано — усі кімнати."""
+    rooms = rooms or data.list_rooms(scenes)
     rows, merges = [], []
     for room in rooms:
         r, m = process_room(room, model, **kw)
