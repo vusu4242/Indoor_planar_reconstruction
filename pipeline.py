@@ -43,26 +43,29 @@ def align_scale(depth_pred, loaded):
     return float(np.median(scales))
 
 
-def find_planes(P, z, valid, inframe_merge=True, boundary=True, max_behind=0.03):
-    """Площини одного кадру (усе, що не залежить від GT)."""
+def find_planes(P, z, valid, inframe_merge=True, boundary=True, max_behind=0.03,
+                behind_max_mm=None, return_stages=False):
+    """Площини одного кадру (усе, що не залежить від GT).
+    return_stages=True — ще й маски після кожного етапу (для налагодження)."""
+    stages = []
     lab, planes = ransac.sequential_ransac(P, z, valid)
+    stages.append(("RANSAC", lab, len(planes)))
     lab, planes = aggregation.clean_planes(lab, planes, P)
+    stages.append(("очищення", lab, len(planes)))
     if inframe_merge:
         lab, planes = aggregation.merge_coplanar(lab, planes, P)
+        stages.append(("злиття шматків", lab, len(planes)))
     if boundary:
-        lab, planes = aggregation.filter_boundary(lab, planes, P, valid, max_behind=max_behind)
+        lab, planes = aggregation.filter_boundary(lab, planes, P, valid, max_behind=max_behind,
+                                                  behind_max_mm=behind_max_mm)
+        stages.append(("фільтр меж", lab, len(planes)))
+    if return_stages:
+        return lab, planes, stages
     return lab, planes
 
 
-def process_room(room, model, conf_pct=30, inframe_merge=True, boundary=True,
-                 max_behind=0.03, use_cache=True, return_planes=False, scale_mode="self"):
-    """scale_mode:
-        "self"   — метод не бачить GT; масштаб з самої VGGT; GT-масштаб застосовується
-                   лише до відстаней площин під час оцінки (чесний варіант);
-        "oracle" — масштаб за GT ще до пошуку площин (як було раніше; верхня межа)."""
-    names = data.room_frames(room)
-    v = get_vggt(room, model, use_cache)
-    loaded = [data.load_frame(n) for n in names]
+def _scales(v, loaded, scale_mode, conf_pct):
+    """Масштаб для методу і поправка відстаней для оцінки."""
     gt_scale = align_scale(v["depth"], loaded)             # потрібен лише для оцінки
     if scale_mode == "oracle":
         sc = gt_scale
@@ -70,18 +73,51 @@ def process_room(room, model, conf_pct=30, inframe_merge=True, boundary=True,
         sc = self_scale(v["depth"], v["conf"], conf_pct)
     else:
         raise ValueError("scale_mode: 'self' або 'oracle'")
-    eval_fix = gt_scale / sc                               # поправка відстаней для оцінки
+    return sc, gt_scale / sc
+
+
+def debug_frame(room, model, frame_idx=0, conf_pct=30, scale_mode="self", gt_semantic=False, **kw):
+    """Маски одного кадру після кожного етапу, щоб побачити, де губляться площини.
+    Повертає (rgb, GT-маска, [(назва етапу, маска у повному розмірі, кількість площин), ...])."""
+    names = data.room_frames(room)
+    v = get_vggt(room, model)
+    loaded = [data.load_frame(n) for n in names]
+    sc, _ = _scales(v, loaded, scale_mode, conf_pct)
+    s, f = frame_idx, loaded[frame_idx]
+    z = v["depth"][s] * sc
+    P = data.backproject(z, v["intr"][s])
+    valid = v["conf"][s] > np.percentile(v["conf"][s], conf_pct)
+    _, _, stages = find_planes(P, z, valid, return_stages=True, **kw)
+    H, W = f["rgb"].shape[:2]
+    up = lambda m: cv2.resize(m.astype(np.int32), (W, H), interpolation=cv2.INTER_NEAREST)
+    out = [("пікселі після фільтра впевненості", up(valid), int(valid.mean() * 100))]
+    out += [(name, up(lab), n) for name, lab, n in stages]
+    return f["rgb"], gt.gt_frame(f, use_semantic=gt_semantic)["mask"], out
+
+
+def process_room(room, model, conf_pct=30, inframe_merge=True, boundary=True,
+                 max_behind=0.03, behind_max_mm=None, use_cache=True, return_planes=False,
+                 scale_mode="self", gt_semantic=False):
+    """scale_mode:
+        "self"   — метод не бачить GT; масштаб з самої VGGT; GT-масштаб застосовується
+                   лише до відстаней площин під час оцінки (чесний варіант);
+        "oracle" — масштаб за GT ще до пошуку площин (як було раніше; верхня межа).
+    gt_semantic — протокол GT: True = ще й семантика (без вікон, жалюзі, дверей)."""
+    names = data.room_frames(room)
+    v = get_vggt(room, model, use_cache)
+    loaded = [data.load_frame(n) for n in names]
+    sc, eval_fix = _scales(v, loaded, scale_mode, conf_pct)
 
     rows, items, frames_out = [], [], []
     for s, f in enumerate(loaded):
         z = v["depth"][s] * sc
         P = data.backproject(z, v["intr"][s])
         valid = v["conf"][s] > np.percentile(v["conf"][s], conf_pct)
-        lab, planes = find_planes(P, z, valid, inframe_merge, boundary, max_behind)
+        lab, planes = find_planes(P, z, valid, inframe_merge, boundary, max_behind, behind_max_mm)
 
         H, W = f["rgb"].shape[:2]
         lab_full = cv2.resize(lab, (W, H), interpolation=cv2.INTER_NEAREST)
-        g = gt.gt_frame(f)
+        g = gt.gt_frame(f, use_semantic=gt_semantic)
         planes_eval = [{**p, "d": p["d"] * eval_fix} for p in planes]   # GT торкається лише оцінки
         m = metrics.evaluate(lab_full, planes_eval, g)
         gt_id = {q["label"]: q["id"] for q in g["planes"]}
