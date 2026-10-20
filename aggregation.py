@@ -73,14 +73,24 @@ def merge_coplanar(lab, planes, P, ang_thr=5, d_abs=60, d_rel=0.03):
     return _relabel(lab, groups.values(), P)
 
 
-def filter_boundary(lab, planes, P, valid, max_behind=0.03, tol_mm=100, tol_rel=0.03):
-    """Залишає лише площини, за якими майже немає точок кадру (межі кімнати)."""
+def filter_boundary(lab, planes, P, valid, max_behind=0.03, tol_mm=100, tol_rel=0.03,
+                    behind_max_mm=None):
+    """Залишає лише площини, за якими майже немає точок кадру (межі кімнати).
+
+    behind_max_mm — рахувати лише точки, що лежать за площиною НЕ далі за це число мм.
+        Під стільницею підлога (~0.7 м), за фасадом шафи стіна (~0.5 м) — вони рахуються.
+        Вулиця крізь вікно чи сусідня кімната крізь скло (метри) — ні, тож стіни
+        з вікнами не відкидаються. None — рахувати всі точки за площиною (як раніше)."""
     X = P[valid]
     tol = np.maximum(tol_mm, tol_rel * X[:, 2])
     out = np.zeros_like(lab)
     kept = []
     for p in planes:
-        behind = np.mean(X @ p["n"] + p["d"] < -tol)        # частка точок за площиною
+        s = X @ p["n"] + p["d"]                              # відстань зі знаком (мінус = за площиною)
+        is_behind = s < -tol
+        if behind_max_mm is not None:
+            is_behind &= s > -behind_max_mm
+        behind = np.mean(is_behind)                          # частка точок за площиною
         if behind <= max_behind:
             kept.append({**p, "label": len(kept) + 1, "behind": float(behind)})
             out[lab == p["label"]] = len(kept)
