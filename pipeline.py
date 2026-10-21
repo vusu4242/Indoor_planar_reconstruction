@@ -65,8 +65,7 @@ def find_planes(P, z, valid, inframe_merge=True, boundary=True, max_behind=0.03,
         stages.append(("RANSAC в областях", lab, len(planes)))
     else:
         raise ValueError("order: 'ransac_first' або 'segment_first'")
-    lab, planes = aggregation.clean_planes(lab, planes, P, min_frac=clean_min_frac,
-                                           open_k=open_k, close_k=close_k)
+    lab, planes = aggregation.clean_planes(lab, planes, P, min_frac=clean_min_frac, open_k=open_k)
     stages.append(("очищення", lab, len(planes)))
     if inframe_merge:
         lab, planes = aggregation.merge_coplanar(lab, planes, P)
@@ -76,6 +75,9 @@ def find_planes(P, z, valid, inframe_merge=True, boundary=True, max_behind=0.03,
                                                   behind_max_mm=behind_max_mm,
                                                   footprint_margin_mm=footprint_margin_mm)
         stages.append(("фільтр меж", lab, len(planes)))
+    if close_k:
+        lab = aggregation.fill_holes(lab, close_k)           # лише маски, геометрія не змінюється
+        stages.append(("closing", lab, len(planes)))
     if return_stages:
         return lab, planes, stages
     return lab, planes
@@ -93,7 +95,8 @@ def _scales(v, loaded, scale_mode, conf_pct):
     return sc, gt_scale / sc
 
 
-def debug_frame(room, model, frame_idx=0, conf_pct=30, scale_mode="self", gt_semantic=False, **kw):
+def debug_frame(room, model, frame_idx=0, conf_pct=30, scale_mode="self", gt_semantic=False,
+                bilateral_d=0, bilateral_sigma_rel=0.02, **kw):
     """Маски одного кадру після кожного етапу, щоб побачити, де губляться площини.
     Повертає (rgb, GT-маска, [(назва етапу, маска у повному розмірі, кількість площин), ...])."""
     names = data.room_frames(room)
@@ -101,7 +104,7 @@ def debug_frame(room, model, frame_idx=0, conf_pct=30, scale_mode="self", gt_sem
     loaded = [data.load_frame(n) for n in names]
     sc, _ = _scales(v, loaded, scale_mode, conf_pct)
     s, f = frame_idx, loaded[frame_idx]
-    z = v["depth"][s] * sc
+    z = data.smooth_depth(v["depth"][s] * sc, bilateral_d, bilateral_sigma_rel)
     P = data.backproject(z, v["intr"][s])
     valid = v["conf"][s] > np.percentile(v["conf"][s], conf_pct)
     _, _, stages = find_planes(P, z, valid, return_stages=True, **kw)
@@ -115,11 +118,12 @@ def debug_frame(room, model, frame_idx=0, conf_pct=30, scale_mode="self", gt_sem
 def process_room(room, model, conf_pct=30, inframe_merge=True, boundary=True,
                  max_behind=0.03, behind_max_mm=None, open_k=3, close_k=0, footprint_margin_mm=None,
                  ransac_min_frac=0.01, clean_min_frac=0.005, order="ransac_first",
-                 seg_angle_deg=10, seg_depth_rel=0.03, use_cache=True, return_planes=False, scale_mode="self", gt_semantic=False):
+                 seg_angle_deg=10, seg_depth_rel=0.03, bilateral_d=0, bilateral_sigma_rel=0.02,
+                 use_cache=True, return_planes=False, scale_mode="self", gt_semantic=False):
     """scale_mode:
         "self"   — метод не бачить GT; масштаб з самої VGGT; GT-масштаб застосовується
                    лише до відстаней площин під час оцінки (чесний варіант);
-        "oracle" — масштаб за GT ще до пошуку площин (як було раніше; верхня межа).
+        "oracle" — масштаб за GT ще до пошуку площин (верхня межа).
     gt_semantic — протокол GT: True = ще й семантика (без вікон, жалюзі, дверей)."""
     names = data.room_frames(room)
     v = get_vggt(room, model, use_cache)
@@ -128,7 +132,7 @@ def process_room(room, model, conf_pct=30, inframe_merge=True, boundary=True,
 
     rows, items, frames_out = [], [], []
     for s, f in enumerate(loaded):
-        z = v["depth"][s] * sc
+        z = data.smooth_depth(v["depth"][s] * sc, bilateral_d, bilateral_sigma_rel)
         P = data.backproject(z, v["intr"][s])
         valid = v["conf"][s] > np.percentile(v["conf"][s], conf_pct)
         lab, planes = find_planes(P, z, valid, inframe_merge, boundary, max_behind, behind_max_mm,
