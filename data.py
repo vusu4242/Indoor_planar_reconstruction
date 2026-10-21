@@ -96,7 +96,10 @@ def list_frames(scenes=None, refresh=False):
     except OSError:
         print(f"готово: {len(_FRAMES)} кадрів (index.txt зберегти не вдалось — немає прав на запис)")
     return _FRAMES
-
+def load_split(name):
+    """Сцени з split.json у репозиторії: name = train | val | test."""
+    with open(os.path.join(os.path.dirname(__file__), "split.json")) as f:
+        return json.load(f)[name]
 
 def list_scenes():
     """Назви сцен на диску (лише верхній рівень — швидко)."""
