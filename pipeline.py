@@ -25,7 +25,7 @@ def get_vggt(room, model, use_cache=True):
     return v
 
 
-def self_scale(depth_pred, conf, conf_pct=10, target_mm=2500.0):
+def self_scale(depth_pred, conf, conf_pct=30, target_mm=2500.0):
     """Масштаб БЕЗ GT: медіанна глибина кімнати стає target_mm (типова відстань у кімнаті)."""
     vals = [depth_pred[s][conf[s] > np.percentile(conf[s], conf_pct)] for s in range(len(depth_pred))]
     return float(target_mm / np.median(np.concatenate(vals)))
