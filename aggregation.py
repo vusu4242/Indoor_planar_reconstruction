@@ -3,6 +3,7 @@
     clean_planes     — розбиття на зв'язні шматки, викидання дрібних;
     merge_coplanar   — злиття шматків однієї площини всередині кадру;
     filter_boundary  — залишаємо лише межі кімнати (за ними майже немає точок);
+    fill_holes       — closing масок наприкінці (геометрію не змінює);
     merge_items      — злиття однакових площин між кадрами (у світових координатах).
 """
 import cv2
@@ -10,6 +11,18 @@ import numpy as np
 from scipy.spatial import cKDTree
 
 from .ransac import fit_plane_pca
+
+
+def fill_holes(lab, k=5):
+    """Closing для кожної площини: заклеює дірки й щілини до розміру ядра k.
+    Заповнює лише пікселі, що не належать жодній площині (0), і НЕ перераховує площини,
+    тож на геометрію (нормалі, відстані) не впливає — змінюються лише маски."""
+    out = lab.copy()
+    kernel = np.ones((k, k), np.uint8)
+    for lbl in np.unique(lab[lab > 0]):
+        m = cv2.morphologyEx((lab == lbl).astype(np.uint8), cv2.MORPH_CLOSE, kernel).astype(bool)
+        out[m & (out == 0)] = lbl
+    return out
 
 
 def _union_find(n, pairs_ok):
@@ -40,11 +53,12 @@ def _relabel(lab, groups_of_labels, P):
     return out, new
 
 
-def clean_planes(lab, planes, P, min_frac=0.005, open_k=3, close_k=0):
+def clean_planes(lab, planes, P, min_frac=0.005, open_k=3):
     """Ділить кожну площину на зв'язні шматки, викидає дрібні, перераховує площини.
 
-    open_k  — розмір ядра opening (прибирає шум, тонкі смужки й містки); 0 — вимкнено.
-    close_k — розмір ядра closing (заклеює маленькі дірки й щілини); 0 — вимкнено."""
+    open_k — розмір ядра opening (прибирає шум, тонкі смужки й містки); 0 — вимкнено.
+    Розміри в пікселях маски VGGT (294×518): 3 тут ≈ 7 пікселів на повному кадрі 1280×720.
+    (Closing — окремо, в fill_holes, наприкінці пайплайну.)"""
     h, w = lab.shape
     out = np.zeros_like(lab)
     new = []
@@ -52,9 +66,6 @@ def clean_planes(lab, planes, P, min_frac=0.005, open_k=3, close_k=0):
         m = (lab == p["label"]).astype(np.uint8)
         if open_k:
             m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((open_k, open_k), np.uint8))
-        if close_k:
-            m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((close_k, close_k), np.uint8))
-            m &= (lab == p["label"]) | (lab == 0)            # не забираємо пікселі інших площин
         nc, cc, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
         for c in range(1, nc):
             if stats[c, cv2.CC_STAT_AREA] < min_frac * h * w:
@@ -91,9 +102,9 @@ def filter_boundary(lab, planes, P, valid, max_behind=0.03, tol_mm=100, tol_rel=
                     behind_max_mm=None, footprint_margin_mm=None):
     """Залишає лише площини, за якими майже немає точок кадру (межі кімнати).
 
-    behind_max_mm — рахувати лише точки, що лежать за площиною не далі за це число мм.
-    footprint_margin_mm — рахувати лише точки, що лежать за площиною в межах самої площини
-        (плюс запас у мм). None — без цих обмежень (як було спочатку)."""
+    behind_max_mm — рахувати лише точки, що лежать за площиною НЕ далі за це число мм.
+    footprint_margin_mm — рахувати лише точки, що лежать за площиною В МЕЖАХ самої площини
+        (плюс запас у мм). None — без цих обмежень."""
     X = P[valid]
     tol = np.maximum(tol_mm, tol_rel * X[:, 2])
     out = np.zeros_like(lab)
@@ -113,10 +124,10 @@ def filter_boundary(lab, planes, P, valid, max_behind=0.03, tol_mm=100, tol_rel=
             m = footprint_margin_mm
             idx = np.flatnonzero(is_behind)
             B = X[idx] - c
-            bu, bv = B @ u, B @ v
+            bu, bv = B @ u, B @ v                            # проєкції точок «за площиною»
             inside = (bu > lo_u - m) & (bu < hi_u + m) & (bv > lo_v - m) & (bv < hi_v + m)
             is_behind = np.zeros_like(is_behind)
-            is_behind[idx[inside]] = True
+            is_behind[idx[inside]] = True                    # лише ті, що прямо за площиною
         behind = np.mean(is_behind)                          # частка точок за площиною
         if behind <= max_behind:
             kept.append({**p, "label": len(kept) + 1, "behind": float(behind)})
