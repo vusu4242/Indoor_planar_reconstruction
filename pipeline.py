@@ -44,20 +44,37 @@ def align_scale(depth_pred, loaded):
 
 
 def find_planes(P, z, valid, inframe_merge=True, boundary=True, max_behind=0.03,
-                behind_max_mm=None, return_stages=False):
+                behind_max_mm=None, open_k=3, close_k=0, footprint_margin_mm=None,
+                ransac_min_frac=0.01, clean_min_frac=0.005, order="ransac_first",
+                seg_angle_deg=10, seg_depth_rel=0.03, return_stages=False):
     """Площини одного кадру (усе, що не залежить від GT).
+    order="ransac_first"  — RANSAC по всьому кадру (як було);
+    order="segment_first" — спершу різати на області за нормалями/глибиною, потім RANSAC
+                            у кожній області (seg_angle_deg, seg_depth_rel — пороги меж).
     return_stages=True — ще й маски після кожного етапу (для налагодження)."""
     stages = []
-    lab, planes = ransac.sequential_ransac(P, z, valid)
-    stages.append(("RANSAC", lab, len(planes)))
-    lab, planes = aggregation.clean_planes(lab, planes, P)
+    if order == "ransac_first":
+        lab, planes = ransac.sequential_ransac(P, z, valid, min_frac=ransac_min_frac)
+        stages.append(("RANSAC", lab, len(planes)))
+    elif order == "segment_first":
+        lab, planes, seg = ransac.segment_then_ransac(P, z, valid, angle_deg=seg_angle_deg,
+                                                      depth_rel=seg_depth_rel,
+                                                      seg_min_frac=clean_min_frac,
+                                                      return_segments=True)
+        stages.append(("області", seg, int(seg.max())))
+        stages.append(("RANSAC в областях", lab, len(planes)))
+    else:
+        raise ValueError("order: 'ransac_first' або 'segment_first'")
+    lab, planes = aggregation.clean_planes(lab, planes, P, min_frac=clean_min_frac,
+                                           open_k=open_k, close_k=close_k)
     stages.append(("очищення", lab, len(planes)))
     if inframe_merge:
         lab, planes = aggregation.merge_coplanar(lab, planes, P)
         stages.append(("злиття шматків", lab, len(planes)))
     if boundary:
         lab, planes = aggregation.filter_boundary(lab, planes, P, valid, max_behind=max_behind,
-                                                  behind_max_mm=behind_max_mm)
+                                                  behind_max_mm=behind_max_mm,
+                                                  footprint_margin_mm=footprint_margin_mm)
         stages.append(("фільтр меж", lab, len(planes)))
     if return_stages:
         return lab, planes, stages
@@ -96,8 +113,9 @@ def debug_frame(room, model, frame_idx=0, conf_pct=30, scale_mode="self", gt_sem
 
 
 def process_room(room, model, conf_pct=30, inframe_merge=True, boundary=True,
-                 max_behind=0.03, behind_max_mm=None, use_cache=True, return_planes=False,
-                 scale_mode="self", gt_semantic=False):
+                 max_behind=0.03, behind_max_mm=None, open_k=3, close_k=0, footprint_margin_mm=None,
+                 ransac_min_frac=0.01, clean_min_frac=0.005, order="ransac_first",
+                 seg_angle_deg=10, seg_depth_rel=0.03, use_cache=True, return_planes=False, scale_mode="self", gt_semantic=False):
     """scale_mode:
         "self"   — метод не бачить GT; масштаб з самої VGGT; GT-масштаб застосовується
                    лише до відстаней площин під час оцінки (чесний варіант);
@@ -113,7 +131,10 @@ def process_room(room, model, conf_pct=30, inframe_merge=True, boundary=True,
         z = v["depth"][s] * sc
         P = data.backproject(z, v["intr"][s])
         valid = v["conf"][s] > np.percentile(v["conf"][s], conf_pct)
-        lab, planes = find_planes(P, z, valid, inframe_merge, boundary, max_behind, behind_max_mm)
+        lab, planes = find_planes(P, z, valid, inframe_merge, boundary, max_behind, behind_max_mm,
+                                   open_k, close_k, footprint_margin_mm,
+                                   ransac_min_frac, clean_min_frac, order,
+                                   seg_angle_deg, seg_depth_rel)
 
         H, W = f["rgb"].shape[:2]
         lab_full = cv2.resize(lab, (W, H), interpolation=cv2.INTER_NEAREST)
