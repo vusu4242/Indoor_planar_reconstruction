@@ -21,9 +21,9 @@
 """
 import importlib
 
-from . import data, gt, vggt_model, ransac, aggregation, metrics, pipeline
+from . import data, gt, vggt_model, ransac, aggregation, metrics, pipeline, planar_head
 
-_ORDER = ["data", "gt", "vggt_model", "ransac", "aggregation", "metrics", "pipeline"]
+_ORDER = ["data", "gt", "vggt_model", "ransac", "aggregation", "metrics", "pipeline", "planar_head"]
 
 
 def set_root(path):
