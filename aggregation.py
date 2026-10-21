@@ -40,15 +40,21 @@ def _relabel(lab, groups_of_labels, P):
     return out, new
 
 
-def clean_planes(lab, planes, P, min_frac=0.005):
-    """Ділить кожну площину на зв'язні шматки, викидає дрібні, перераховує площини."""
+def clean_planes(lab, planes, P, min_frac=0.005, open_k=3, close_k=0):
+    """Ділить кожну площину на зв'язні шматки, викидає дрібні, перераховує площини.
+
+    open_k  — розмір ядра opening (прибирає шум, тонкі смужки й містки); 0 — вимкнено.
+    close_k — розмір ядра closing (заклеює маленькі дірки й щілини); 0 — вимкнено."""
     h, w = lab.shape
     out = np.zeros_like(lab)
     new = []
-    kernel = np.ones((3, 3), np.uint8)
     for p in planes:
         m = (lab == p["label"]).astype(np.uint8)
-        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, kernel)      # рвемо тонкі «містки»
+        if open_k:
+            m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((open_k, open_k), np.uint8))
+        if close_k:
+            m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((close_k, close_k), np.uint8))
+            m &= (lab == p["label"]) | (lab == 0)            # не забираємо пікселі інших площин
         nc, cc, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
         for c in range(1, nc):
             if stats[c, cv2.CC_STAT_AREA] < min_frac * h * w:
@@ -73,14 +79,21 @@ def merge_coplanar(lab, planes, P, ang_thr=5, d_abs=60, d_rel=0.03):
     return _relabel(lab, groups.values(), P)
 
 
+def _plane_basis(n):
+    """Дві одиничні осі, що лежать у площині з нормаллю n."""
+    a = np.array([1.0, 0, 0]) if abs(n[0]) < 0.9 else np.array([0, 1.0, 0])
+    u = np.cross(n, a)
+    u /= np.linalg.norm(u)
+    return u, np.cross(n, u)
+
+
 def filter_boundary(lab, planes, P, valid, max_behind=0.03, tol_mm=100, tol_rel=0.03,
-                    behind_max_mm=None):
+                    behind_max_mm=None, footprint_margin_mm=None):
     """Залишає лише площини, за якими майже немає точок кадру (межі кімнати).
 
-    behind_max_mm — рахувати лише точки, що лежать за площиною НЕ далі за це число мм.
-        Під стільницею підлога (~0.7 м), за фасадом шафи стіна (~0.5 м) — вони рахуються.
-        Вулиця крізь вікно чи сусідня кімната крізь скло (метри) — ні, тож стіни
-        з вікнами не відкидаються. None — рахувати всі точки за площиною (як раніше)."""
+    behind_max_mm — рахувати лише точки, що лежать за площиною не далі за це число мм.
+    footprint_margin_mm — рахувати лише точки, що лежать за площиною в межах самої площини
+        (плюс запас у мм). None — без цих обмежень (як було спочатку)."""
     X = P[valid]
     tol = np.maximum(tol_mm, tol_rel * X[:, 2])
     out = np.zeros_like(lab)
@@ -90,6 +103,20 @@ def filter_boundary(lab, planes, P, valid, max_behind=0.03, tol_mm=100, tol_rel=
         is_behind = s < -tol
         if behind_max_mm is not None:
             is_behind &= s > -behind_max_mm
+        if footprint_margin_mm is not None and is_behind.any():
+            own = P[lab == p["label"]]                       # точки самої площини
+            u, v = _plane_basis(p["n"])
+            c = own.mean(0)
+            ou, ov = (own - c) @ u, (own - c) @ v
+            lo_u, hi_u = np.percentile(ou, [2, 98])
+            lo_v, hi_v = np.percentile(ov, [2, 98])
+            m = footprint_margin_mm
+            idx = np.flatnonzero(is_behind)
+            B = X[idx] - c
+            bu, bv = B @ u, B @ v
+            inside = (bu > lo_u - m) & (bu < hi_u + m) & (bv > lo_v - m) & (bv < hi_v + m)
+            is_behind = np.zeros_like(is_behind)
+            is_behind[idx[inside]] = True
         behind = np.mean(is_behind)                          # частка точок за площиною
         if behind <= max_behind:
             kept.append({**p, "label": len(kept) + 1, "behind": float(behind)})
