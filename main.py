@@ -1,22 +1,14 @@
 """
-Точка входу: запуск пайплайну (варіант 1) з командного рядка.
+Runs the whole pipeline (VGGT+aggregation) with one command and saves the results.
 
-Приклади (у Colab, з папки, ВСЕРЕДИНІ якої лежить пакет planes, тобто з /content):
+Usage in Colab:
+    !cd /content && python -m planes.main --root "/content/drive/MyDrive/AI project/dataset" --split val
 
-    # базовий запуск на val-сценах з split.json
-    !cd /content && python -m planes.main --root /content/data --split val
-
-    # конкретні сцени, перші 3 кімнати, масштаб за GT (верхня межа)
-    !cd /content && python -m planes.main --root /content/data --scenes scene_00000 --limit 3 --scale-mode oracle
-
-    # абляції: RANSAC -> + злиття шматків -> + фільтр меж
-    !cd /content && python -m planes.main --root /content/data --split val --ablation
-
-Результати пишуться в --out (за замовчуванням results/<назва запуску>/):
-    summary.csv  — підсумок (один рядок на конфігурацію)
-    frames.csv   — метрики по кожному кадру
-    merge.csv    — злиття площин між кадрами по кімнатах
-    config.json  — з якими параметрами запускали
+Results (in results/<run name>/):
+    summary.csv   overall metrics
+    frames.csv    metrics for every frame
+    merge.csv     merging of planes across frames, per room
+    config.json   parameters of the run
 """
 import argparse
 import json
@@ -31,40 +23,46 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def parse_args():
-    ap = argparse.ArgumentParser(description="Площинні примітиви: варіант 1 (VGGT + агрегація)")
-    ap.add_argument("--root", required=True, help="папка з даними (scene_*/room*/view*/...)")
+    """Command-line parameters (defaults are the same as in pipeline.process_room)."""
+    ap = argparse.ArgumentParser(description="Planar primitives: Variant 1 (VGGT + aggregation)")
+    ap.add_argument("--root", required=True, help="dataset folder (scene_*/room*/view*/...)")
     g = ap.add_mutually_exclusive_group()
-    g.add_argument("--split", choices=["dev", "val", "test"], help="набір сцен з split.json")
-    g.add_argument("--scenes", nargs="+", help="конкретні сцени, напр. scene_00000 scene_00001")
+    g.add_argument("--split", choices=["train", "val", "test"], help="set of scenes from split.json")
+    g.add_argument("--scenes", nargs="+", help="specific scenes, e.g. scene_00000 scene_00001")
     ap.add_argument("--split-file", default=os.path.join(HERE, "split.json"))
-    ap.add_argument("--limit", type=int, default=None, help="взяти лише перші N кімнат")
-    ap.add_argument("--scale-mode", choices=["self", "oracle"], default="self")
-    ap.add_argument("--conf-pct", type=float, default=30)
-    ap.add_argument("--no-merge", action="store_true", help="вимкнути злиття шматків у кадрі")
-    ap.add_argument("--no-boundary", action="store_true", help="вимкнути фільтр меж")
-    ap.add_argument("--max-behind", type=float, default=0.03)
-    ap.add_argument("--behind-max-mm", type=float, default=None)
+    ap.add_argument("--limit", type=int, default=None, help="use only the first N rooms")
+    ap.add_argument("--scale-mode", choices=["self", "oracle"], default="self",
+                    help="self = scale without GT (honest); oracle = scale from GT (upper bound)")
+    ap.add_argument("--conf-pct", type=float, default=30,
+                    help="drop this percentage of least confident pixels in every frame")
+    ap.add_argument("--no-merge", action="store_true", help="turn off merging of pieces within a frame")
+    ap.add_argument("--no-boundary", action="store_true", help="turn off the boundary filter")
+    ap.add_argument("--max-behind", type=float, default=0.03,
+                    help="boundary filter: max fraction of points behind a plane")
+    ap.add_argument("--behind-max-mm", type=float, default=None,
+                    help="boundary filter: count only points at most this far behind a plane (mm)")
     ap.add_argument("--footprint-margin-mm", type=float, default=None,
-                    help="фільтр меж лише в межах площини (+ запас, мм); без параметра — як раніше")
-    ap.add_argument("--order", choices=["ransac_first", "segment_first"], default="ransac_first",
-                    help="спершу RANSAC по кадру чи спершу різати на області")
-    ap.add_argument("--seg-angle-deg", type=float, default=10, help="segment_first: поріг кута нормалей")
-    ap.add_argument("--seg-depth-rel", type=float, default=0.03, help="segment_first: поріг стрибка глибини")
+                    help="boundary filter: count only points behind the plane itself (+ margin, mm)")
+    ap.add_argument("--bilateral-d", type=int, default=0,
+                    help="bilateral depth filter: neighbourhood size in pixels (0 = off)")
+    ap.add_argument("--bilateral-sigma-rel", type=float, default=0.02,
+                    help="bilateral: edge threshold as a fraction of depth")
     ap.add_argument("--ransac-min-frac", type=float, default=0.01,
-                    help="RANSAC: мінімальна частка точок у площині (зупинка пошуку)")
+                    help="RANSAC: minimal fraction of points in a plane (stops the search)")
     ap.add_argument("--clean-min-frac", type=float, default=0.005,
-                    help="очищення: мінімальний розмір шматка як частка кадру")
-    ap.add_argument("--open-k", type=int, default=3, help="ядро opening в очищенні (0 = вимкнено)")
-    ap.add_argument("--close-k", type=int, default=0, help="ядро closing в очищенні (0 = вимкнено)")
-    ap.add_argument("--gt-semantic", action="store_true", help="GT з семантикою (без вікон, жалюзі)")
+                    help="cleaning: minimal piece size as a fraction of the frame")
+    ap.add_argument("--open-k", type=int, default=3, help="opening kernel in cleaning (0 = off)")
+    ap.add_argument("--close-k", type=int, default=0, help="closing kernel at the end (0 = off)")
+    ap.add_argument("--gt-semantic", action="store_true", help="GT with semantics (no windows, blinds)")
     ap.add_argument("--ablation", action="store_true",
-                    help="порівняти RANSAC / + злиття шматків / + фільтр меж")
-    ap.add_argument("--out", default=None, help="куди писати результати")
-    ap.add_argument("--tag", default=None, help="назва запуску (для папки результатів)")
+                    help="compare RANSAC / + merging pieces / + boundary filter")
+    ap.add_argument("--out", default=None, help="where to write the results")
+    ap.add_argument("--tag", default=None, help="name of the run (for the results folder)")
     return ap.parse_args()
 
 
 def pick_rooms(args):
+    """Rooms to process: from --split, from --scenes, or all scenes in --root."""
     data.ROOT = args.root
     data._FRAMES = None
     if args.split:
@@ -74,7 +72,7 @@ def pick_rooms(args):
         scenes = [s for s in split[args.split] if s in on_disk]
         missing = len(split[args.split]) - len(scenes)
         if missing:
-            print(f"увага: {missing} сцен з '{args.split}' немає в {args.root}, пропускаю їх")
+            print(f"warning: {missing} scenes from '{args.split}' are not in {args.root}, skipping them")
     elif args.scenes:
         scenes = args.scenes
     else:
@@ -84,24 +82,26 @@ def pick_rooms(args):
 
 
 def main():
+    """Runs the pipeline for each configuration and saves the result tables."""
     args = parse_args()
     rooms, scenes = pick_rooms(args)
     if not rooms:
-        raise SystemExit("кімнат не знайдено — перевірте --root і назви сцен")
-    print(f"сцен: {len(scenes)}, кімнат: {len(rooms)}")
+        raise SystemExit("no rooms found: check --root and scene names")
+    print(f"scenes: {len(scenes)}, rooms: {len(rooms)}")
 
+    # parameters shared by all configurations
     base = dict(conf_pct=args.conf_pct, scale_mode=args.scale_mode, gt_semantic=args.gt_semantic,
                 max_behind=args.max_behind, behind_max_mm=args.behind_max_mm,
                 open_k=args.open_k, close_k=args.close_k,
                 footprint_margin_mm=args.footprint_margin_mm,
                 ransac_min_frac=args.ransac_min_frac, clean_min_frac=args.clean_min_frac,
-                order=args.order, seg_angle_deg=args.seg_angle_deg, seg_depth_rel=args.seg_depth_rel)
+                bilateral_d=args.bilateral_d, bilateral_sigma_rel=args.bilateral_sigma_rel)
     if args.ablation:
         configs = {"RANSAC": dict(inframe_merge=False, boundary=False),
-                   "+ злиття шматків": dict(inframe_merge=True, boundary=False),
-                   "+ злиття шматків + фільтр меж": dict(inframe_merge=True, boundary=True)}
+                   "+ merging pieces": dict(inframe_merge=True, boundary=False),
+                   "+ merging pieces + boundary filter": dict(inframe_merge=True, boundary=True)}
     else:
-        configs = {"основний": dict(inframe_merge=not args.no_merge, boundary=not args.no_boundary)}
+        configs = {"main": dict(inframe_merge=not args.no_merge, boundary=not args.no_boundary)}
 
     tag = args.tag or f'{args.split or "custom"}_{args.scale_mode}_{time.strftime("%m%d-%H%M")}'
     out = args.out or os.path.join("results", tag)
@@ -112,12 +112,12 @@ def main():
     for name, kw in configs.items():
         t0 = time.time()
         summ, frames_df, merge_df = pipeline.run_all(model, rooms=rooms, **base, **kw)
-        summ["кадрів"] = len(frames_df)
-        summ["час_с"] = round(time.time() - t0)
+        summ["frames"] = len(frames_df)
+        summ["time_s"] = round(time.time() - t0)
         summary[name] = summ
-        all_frames.append(frames_df.assign(конфігурація=name))
-        all_merge.append(merge_df.assign(конфігурація=name))
-        print(f"готово: {name}  F1={summ['F1']}")
+        all_frames.append(frames_df.assign(config=name))
+        all_merge.append(merge_df.assign(config=name))
+        print(f"done: {name}  F1={summ['F1']}")
 
     table = pd.DataFrame(summary).T
     print()
@@ -127,7 +127,7 @@ def main():
     pd.concat(all_merge).to_csv(os.path.join(out, "merge.csv"), index=False)
     with open(os.path.join(out, "config.json"), "w") as f:
         json.dump({**vars(args), "rooms": rooms}, f, indent=1, ensure_ascii=False)
-    print(f"\nрезультати збережено в {out}")
+    print(f"\nresults saved to {out}")
 
 
 if __name__ == "__main__":
