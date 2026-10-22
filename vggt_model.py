@@ -1,27 +1,27 @@
 """
-Етап 3. Foundation-модель VGGT: фото кімнати -> глибина, впевненість, камери.
-
-Встановлення в Colab (потім Runtime -> Restart session):
-    !pip install -q "numpy>=2.1,<2.3"
-    !pip install -q --no-deps git+https://github.com/facebookresearch/vggt.git
-    !pip install -q huggingface_hub safetensors einops
+(3) Foundation model VGGT:
+        Input: photo of room(path to dataset)
+        Output: depth mask, confidence matrix, cameras(int,ext)
 """
 from . import data
 
 
 def load_model():
-    """Завантажує VGGT-1B на GPU."""
+    """Downloading VGGT-1B on GPU"""
     from vggt.models.vggt import VGGT
     return VGGT.from_pretrained("facebook/VGGT-1B").to("cuda").eval()
 
 
 def run_vggt(model, names):
-    """VGGT на кадрах однієї кімнати. Усі виходи — numpy, розмір VGGT (зазвичай 294×518).
-
-    depth: (кадри, h, w)   глибина в умовному масштабі
-    conf:  (кадри, h, w)   впевненість у глибині
-    extr:  (кадри, 3, 4)   камера: X_cam = R·X_world + t (світ = перша камера)
-    intr:  (кадри, 3, 3)   матриця K для розміру h×w
+    """VGGT on frames of one room. All outputs are numpy arrays.
+   Images are resized before VGGT: width 518, height rounded to a multiple of 14
+    (1280×720 -> 518×294, width × height), so depth and conf have shape (294, 518),
+    not the size of the original photo.
+        Outputs:
+        depth: (frames, h, w)   depth in arbitrary scale (not mm)
+        conf:  (frames, h, w)   confidence of depth (>= 1)
+        extr:  (frames, 3, 4)   camera: X_cam = R·X_world + t (world = first camera)
+        intr:  (frames, 3, 3)   matrix K for the h×w image (not for the original photo)
     """
     import torch
     from vggt.utils.load_fn import load_and_preprocess_images
