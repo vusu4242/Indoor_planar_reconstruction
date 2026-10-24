@@ -1,16 +1,16 @@
 """
-Етап 1. Завантаження даних Structured3D.
+(1) Loading Structured3D data
 
-Структура на диску (усі файли одного кадру в одній папці):
+Structure on drive (all files of one frame are in one folder):
     ROOT/scene_00000/room485142/view0/
-        rgb.png        фото
-        depth.png      глибина z, мм, uint16 (0 = немає даних)
-        semantic.png   семантика (кольори NYU40)
-        layout.json    розмітка площин
-        camera.txt     камера Structured3D
+        rgb.png:
+        depth.png     
+        semantic.png 
+        layout.json   
+        camera.txt     
 
-Назва кадру в коді: scene_00000_room485142_view0.
-Система координат камери: x праворуч, y вниз, z вперед; одиниці — мм.
+Name of frame in code: scene_00000_room485142_view0.
+Camera coordinate system: x-right, y-down, z-forward;; measure - mm
 """
 import glob
 import json
@@ -155,6 +155,18 @@ def backproject(depth, K):
     x = (u - K[0, 2]) / K[0, 0]
     y = (v - K[1, 2]) / K[1, 1]
     return np.stack([x * d, y * d, d], -1)
+
+def smooth_depth(z, d=7, sigma_rel=0.02, sigma_space=5):
+    """Bilateral filter on depth: smooths noise inside surfaces, keeps sharp depth edges.
+    d: neighbourhood size in pixels (0 = off);
+    sigma_rel: depth differences below this fraction of depth (0.02 = 2 %) count as noise;
+    works on log(depth), so the threshold is the same for near and far points;
+    sigma_space: how fast the influence of neighbours decreases with distance (pixels)"""
+    if not d:
+        return z
+    zf = np.log(np.maximum(z, 1e-6)).astype(np.float32)
+    zf = cv2.bilateralFilter(zf, d, float(sigma_rel), float(sigma_space))
+    return np.exp(zf.astype(np.float64))
 
 
 def random_colors(mask, seed=0):
