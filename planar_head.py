@@ -1,24 +1,3 @@
-"""
-Етап 3б / Варіант 2. Planar Head поверх VGGT:
-    PlanarHead       — легка згорткова голова (DPT-style) поверх ознак VGGT;
-    extract_features — витягує проміжні токени VGGT (шари 4, 11, 17, 23) + глибину;
-    planar_loss      — комбінований лосс: семантика (CE) + нормалі (Cosine+L1) + ембедінги (Pull-Push);
-    find_planes_head — виділення площин за передбаченнями голови (сумісне з pipeline.py та metrics.py);
-    cache_features   — один раз проганяє VGGT і зберігає токени + GT кімнати на диск;
-    train_head       — навчання голови на кеші (VGGT заморожена), з контролем на val
-                       і збереженням найкращих ваг.
-
-Порядок у Colab:
-    tr = planes.data.list_rooms(planes.data.load_split("train"))
-    va = planes.data.list_rooms(planes.data.load_split("val"))
-    planes.planar_head.cache_features(model, tr + va)
-    head, hist = planes.planar_head.train_head(tr, va, epochs=20, save_path=".../head.pt")
-
-Передбачення голови для кожного пікселя (розмір VGGT h×w, зазвичай 294×518):
-    sem_logits: (N, 4, h, w)  класи з gt.semantic_classes: 0 інше, 1 стіна, 2 підлога, 3 стеля
-    normal:     (N, 3, h, w)  одиничні нормалі площин у координатах камери (d > 0)
-    embedding:  (N, E, h, w)  ознаки екземплярів для розділення різних стін
-"""
 import os
 import cv2
 import numpy as np
@@ -29,15 +8,13 @@ import torch.nn.functional as F
 
 from . import aggregation, data, gt, metrics, pipeline, ransac
 
-# VGGT-1B має 24 блоки агрегатора, кожен видає токени розмірності 2048 (1024 кадрових + 1024 глобальних)
 LAYER_IDS = (4, 11, 17, 23)
 PATCH_SIZE = 14
 ID_TYPE = {1: "wall", 2: "floor", 3: "ceiling"}
+CACHE_DIR = "/content/cache"
 
 
 class _ResidualConvUnit(nn.Module):
-    """Залишковий згортковий блок для злиття різномасштабних ознак (у стилі DPT)."""
-
     def __init__(self, features):
         super().__init__()
         self.conv1 = nn.Conv2d(features, features, kernel_size=3, padding=1, bias=False)
@@ -53,8 +30,6 @@ class _ResidualConvUnit(nn.Module):
 
 
 class _FeatureFusionBlock(nn.Module):
-    """Злиття ознак двох рівнів із підвищенням роздільної здатності вдвічі."""
-
     def __init__(self, features):
         super().__init__()
         self.res1 = _ResidualConvUnit(features)
@@ -75,24 +50,10 @@ class _FeatureFusionBlock(nn.Module):
 
 
 class PlanarHead(nn.Module):
-    """Голова реконструкції площин поверх токенів агрегатора VGGT та карти глибини.
-
-    Приймає:
-        tokens_list — список із 4 тензорів токенів (N, P_patches, token_dim) з шарів LAYER_IDS
-        depth       — карта глибини VGGT (N, 1, h, w) для геометричної прив'язки (опційно)
-        hw          — цільовий розмір (h, w), кратний PATCH_SIZE=14
-
-    Повертає словник:
-        sem_logits  — (N, 4, h, w) логіти класів (0: інше, 1: стіна, 2: підлога, 3: стеля)
-        normal      — (N, 3, h, w) одиничні вектори нормалей у системі камери
-        embedding   — (N, emb_dim, h, w) L2-нормовані ембедінги екземплярів площин
-    """
-
     def __init__(self, token_dim=2048, features=256, num_classes=4, emb_dim=8, use_depth=True):
         super().__init__()
         self.use_depth = use_depth
 
-        # Проєкція токенів із 4 рівнів трансформера у спільний простір ознак
         self.projects = nn.ModuleList([
             nn.Sequential(
                 nn.Conv2d(token_dim, features, kernel_size=1, bias=False),
@@ -102,7 +63,6 @@ class PlanarHead(nn.Module):
             for _ in range(4)
         ])
 
-        # Різнорівневе масштабування (піраміда ознак x4, x2, x1, x1/2 відносно сітки патчів)
         self.resize_layers = nn.ModuleList([
             nn.ConvTranspose2d(features, features, kernel_size=4, stride=4, padding=0),
             nn.ConvTranspose2d(features, features, kernel_size=2, stride=2, padding=0),
@@ -110,13 +70,11 @@ class PlanarHead(nn.Module):
             nn.Conv2d(features, features, kernel_size=3, stride=2, padding=1),
         ])
 
-        # Каскадне злиття рівнів (від найглибшого до найбільш детального)
         self.refinenet4 = _FeatureFusionBlock(features)
         self.refinenet3 = _FeatureFusionBlock(features)
         self.refinenet2 = _FeatureFusionBlock(features)
         self.refinenet1 = _FeatureFusionBlock(features)
 
-        # Гілка геометричних ознак із карти глибини та її градієнтів
         geo_ch = 32 if use_depth else 0
         if use_depth:
             self.depth_encoder = nn.Sequential(
@@ -130,7 +88,6 @@ class PlanarHead(nn.Module):
 
         in_ch = features + geo_ch
 
-        # Вихідні гілки: семантика (4 класи), нормаль (3 компоненти), ембедінг екземпляра
         self.sem_head = nn.Sequential(
             nn.Conv2d(in_ch, features // 2, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(features // 2),
@@ -152,7 +109,6 @@ class PlanarHead(nn.Module):
 
     @staticmethod
     def _depth_clues(depth):
-        """Нормована глибина та її градієнти вздовж u, v як підказка про злами площин."""
         d_norm = depth / (depth.mean(dim=(-2, -1), keepdim=True).clamp(min=1e-6))
         du = F.pad(d_norm[..., :, 1:] - d_norm[..., :, :-1], (0, 1, 0, 0))
         dv = F.pad(d_norm[..., 1:, :] - d_norm[..., :-1, :], (0, 0, 0, 1))
@@ -191,16 +147,6 @@ class PlanarHead(nn.Module):
 
 
 def extract_vggt_features(model, names, layer_ids=LAYER_IDS):
-    """Проганяє VGGT (без градієнтів) і повертає проміжні токени та геометрію кімнати.
-
-    Повертає словник:
-        tokens: список із 4 тензорів (S, P_patches, 2048) на CPU/GPU
-        depth:  (S, h, w) numpy
-        conf:   (S, h, w) numpy
-        extr:   (S, 3, 4) numpy
-        intr:   (S, 3, 3) numpy
-        hw:     (h, w)
-    """
     from vggt.utils.load_fn import load_and_preprocess_images
     from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 
@@ -208,7 +154,7 @@ def extract_vggt_features(model, names, layer_ids=LAYER_IDS):
     dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
     imgs = load_and_preprocess_images([data.frame_path(n, "rgb") for n in names]).to(device)
     if imgs.ndim == 4:
-        imgs = imgs.unsqueeze(0)                              # (1, S, 3, h, w)
+        imgs = imgs.unsqueeze(0)
     h, w = imgs.shape[-2:]
 
     with torch.no_grad(), torch.autocast("cuda", dtype=dtype):
@@ -237,16 +183,7 @@ def extract_vggt_features(model, names, layer_ids=LAYER_IDS):
     return out
 
 
-# ---------------------------------------------------------------------------
-# Функції втрат (Loss) та підготовка еталонних тензорів із gt.py
-# ---------------------------------------------------------------------------
-
 def build_gt_targets(f, hw):
-    """Готує еталонні карти для одного кадру у розмірі VGGT (h, w):
-        sem_gt:    (h, w) int64   — 0 інше, 1 стіна, 2 підлога, 3 стеля (з gt.semantic_classes)
-        normal_gt: (3, h, w) f32  — нормаль площини в координатах камери (d > 0)
-        inst_gt:   (h, w) int64   — номер площини (0 = не площина, k = площина k)
-    """
     h, w = hw
     sem_full = gt.semantic_classes(f)
     g = gt.gt_frame(f, use_semantic=False)
@@ -268,17 +205,14 @@ def build_gt_targets(f, hw):
 
 
 def _pull_push_loss(emb, inst, margin_pull=0.1, margin_push=0.5, max_pts=512):
-    """Дискримінативний лосс для ембедінгів площин:
-        тягне пікселі однієї площини до її середнього вектора (pull),
-        відштовхує центри різних площин одного кадру (push)."""
     device = emb.device
     total_pull = torch.tensor(0.0, device=device)
     total_push = torch.tensor(0.0, device=device)
     valid_frames = 0
 
     for b in range(emb.shape[0]):
-        eb = emb[b].permute(1, 2, 0)                         # (h, w, E)
-        ib = inst[b]                                         # (h, w)
+        eb = emb[b].permute(1, 2, 0)
+        ib = inst[b]
         labels = [int(l) for l in torch.unique(ib) if l > 0]
         if not labels:
             continue
@@ -297,7 +231,7 @@ def _pull_push_loss(emb, inst, margin_pull=0.1, margin_push=0.5, max_pts=512):
         total_pull = total_pull + pull_b / len(labels)
 
         if len(centers) >= 2:
-            C = torch.stack(centers, dim=0)                  # (K, E)
+            C = torch.stack(centers, dim=0)
             pdist = torch.cdist(C, C, p=2)
             triu = torch.triu(torch.ones_like(pdist, dtype=torch.bool), diagonal=1)
             push_b = F.relu(2.0 * margin_push - pdist[triu]).mean()
@@ -309,8 +243,6 @@ def _pull_push_loss(emb, inst, margin_pull=0.1, margin_push=0.5, max_pts=512):
 
 
 def planar_loss(pred, target, w_sem=1.0, w_norm=1.0, w_emb=0.5):
-    """Сумарна функція втрат PlanarHead:
-        L = w_sem * CE(sem) + w_norm * (1 - cos + L1)(normal) + w_emb * PullPush(emb)."""
     sem_gt = target["sem"].to(pred["sem_logits"].device)
     norm_gt = target["normal"].to(pred["normal"].device)
     inst_gt = target["inst"].to(pred["embedding"].device)
@@ -337,13 +269,8 @@ def planar_loss(pred, target, w_sem=1.0, w_norm=1.0, w_emb=0.5):
     }
 
 
-# ---------------------------------------------------------------------------
-# Інференс: виділення площин за виходами голови та інтеграція з pipeline.py
-# ---------------------------------------------------------------------------
-
 @torch.no_grad()
 def predict_frame_maps(head, feat_room, frame_idx=0):
-    """Запускає PlanarHead для одного кадру кімнати -> numpy-карти sem_cls, sem_prob, normal, emb."""
     device = next(head.parameters()).device
     tokens_s = [t[frame_idx : frame_idx + 1].to(device) for t in feat_room["tokens"]]
     depth_s = torch.from_numpy(feat_room["depth"][frame_idx : frame_idx + 1]).float().to(device)
@@ -359,22 +286,18 @@ def predict_frame_maps(head, feat_room, frame_idx=0):
 
 def _split_walls_by_normal_and_emb(mask_wall, normal_map, emb_map, P, z,
                                    ang_thr=15.0, emb_thr=0.35, min_px=150):
-    """Розділяє маску стін (клас 1) на окремі площини за нормалями голови, ембедінгами та RANSAC."""
     sub_labels = np.zeros_like(mask_wall, dtype=np.int32)
     if mask_wall.sum() < min_px:
         return sub_labels, []
 
-    # 1. Спочатку запускаємо послідовний RANSAC виключно на пікселях стін
     lab_r, planes_r = ransac.sequential_ransac(P, z, mask_wall)
     if not planes_r:
         return sub_labels, []
 
-    # 2. Перевіряємо узгодженість із нормалями голови й розбиваємо зв'язні компоненти
     lab_c, planes_c = aggregation.clean_planes(lab_r, planes_r, P)
     if not planes_c:
         return sub_labels, []
 
-    # 3. Зливаємо копланарні шматки однієї стіни, якщо їхні нормалі та ембедінги близькі
     means_emb = []
     means_nrm = []
     for p in planes_c:
@@ -404,12 +327,6 @@ def _split_walls_by_normal_and_emb(mask_wall, normal_map, emb_map, P, z,
 
 def find_planes_head(P, z, valid, head_maps, prob_thr=0.45, min_frac=0.005,
                      boundary=False, max_behind=0.03, behind_max_mm=None):
-    """Знаходить площини кадру за допомогою передбачень PlanarHead.
-
-    Семантична маска голови автоматично відсікає меблі та сторонні об'єкти (клас 0),
-    розділяє підлогу (клас 2), стелю (клас 3) та окремі стіни (клас 1).
-    Повертає (lab, planes) у тому самому форматі, що й pipeline.find_planes.
-    """
     h, w = valid.shape
     min_px = int(min_frac * h * w)
     sem_cls = head_maps["sem_cls"]
@@ -421,7 +338,6 @@ def find_planes_head(P, z, valid, head_maps, prob_thr=0.45, min_frac=0.005,
     out_lab = np.zeros((h, w), dtype=np.int32)
     planes = []
 
-    # Стіни (клас 1): може бути декілька різних площин у кадрі
     wall_mask = usable & (sem_cls == 1)
     w_lab, w_planes = _split_walls_by_normal_and_emb(
         wall_mask, normal_map, emb_map, P, z, min_px=max(min_px, 50)
@@ -434,7 +350,6 @@ def find_planes_head(P, z, valid, head_maps, prob_thr=0.45, min_frac=0.005,
         out_lab[sel] = k
         planes.append({**p, "label": k, "type": "wall"})
 
-    # Підлога (клас 2) та стеля (клас 3): зазвичай по одній головній площині на клас
     for cls_id in (2, 3):
         cls_mask = usable & (sem_cls == cls_id)
         if cls_mask.sum() < min_px:
@@ -464,7 +379,6 @@ def find_planes_head(P, z, valid, head_maps, prob_thr=0.45, min_frac=0.005,
 def process_room_head(room, model, head, conf_pct=30, prob_thr=0.45, boundary=False,
                       max_behind=0.03, behind_max_mm=None, scale_mode="self",
                       gt_semantic=False, return_planes=False):
-    """Повний пайплайн кімнати з PlanarHead (аналог pipeline.process_room для варіанта 2)."""
     names = data.room_frames(room)
     feat = extract_vggt_features(model, names)
     loaded = [data.load_frame(n) for n in names]
@@ -520,7 +434,6 @@ def process_room_head(room, model, head, conf_pct=30, prob_thr=0.45, boundary=Fa
 
 
 def run_all_head(model, head, rooms=None, scenes=None, **kw):
-    """Запуск пайплайну з PlanarHead по списку кімнат (аналог pipeline.run_all)."""
     rooms = rooms or data.list_rooms(scenes)
     rows, merges = [], []
     for room in rooms:
@@ -535,21 +448,11 @@ def run_all_head(model, head, rooms=None, scenes=None, **kw):
     return summ, pd.DataFrame(rows), mg
 
 
-# ---------------------------------------------------------------------------
-# Навчання та збереження / завантаження ваг PlanarHead
-# ---------------------------------------------------------------------------
-
-CACHE_DIR = "/content/cache"     # локальний диск Colab: швидкий, але зникає після перезапуску
-
-
 def _cache_path(room, cache_dir=None):
     return os.path.join(cache_dir or CACHE_DIR, room + ".pt")
 
 
 def cache_features(model, rooms, cache_dir=None):
-    """Один раз проганяє VGGT для кожної кімнати і зберігає токени (fp16), глибину та GT.
-    Уже збережені кімнати пропускає, тож після обриву можна просто запустити знову.
-    Розмір: ~25–40 МБ на кімнату."""
     cache_dir = cache_dir or CACHE_DIR
     os.makedirs(cache_dir, exist_ok=True)
     todo = [r for r in rooms if not os.path.exists(_cache_path(r, cache_dir))]
@@ -559,7 +462,7 @@ def cache_features(model, rooms, cache_dir=None):
         if not names:
             continue
         feat = extract_vggt_features(model, names)
-        feat["tokens"] = [t.half() for t in feat["tokens"]]           # вдвічі менше місця
+        feat["tokens"] = [t.half() for t in feat["tokens"]]
         targets = [build_gt_targets(data.load_frame(n), feat["hw"]) for n in names]
         torch.save({"feat": feat, "targets": targets}, _cache_path(room, cache_dir))
         if i % 20 == 0 or i == len(todo):
@@ -567,7 +470,6 @@ def cache_features(model, rooms, cache_dir=None):
 
 
 def _load_cached(room, device, cache_dir=None):
-    """Кімната з кешу -> токени, глибина, розмір, GT-тензори (усе на device)."""
     c = torch.load(_cache_path(room, cache_dir), map_location="cpu", weights_only=False)
     feat, targets = c["feat"], c["targets"]
     tokens = [t.float().to(device) for t in feat["tokens"]]
@@ -577,7 +479,6 @@ def _load_cached(room, device, cache_dir=None):
 
 
 def _run_epoch(head, rooms, device, opt=None, cache_dir=None):
-    """Один прохід по кімнатах. opt=None — лише оцінка (val), без навчання."""
     train = opt is not None
     head.train(train)
     out = []
@@ -601,11 +502,6 @@ def _run_epoch(head, rooms, device, opt=None, cache_dir=None):
 
 def train_head(train_rooms, val_rooms=None, epochs=20, lr=1e-3, weight_decay=1e-4,
                save_path=None, device="cuda", cache_dir=None, seed=0):
-    """Навчає PlanarHead на закешованих кімнатах (спершу cache_features).
-
-    Після кожної епохи — loss на val; save_path зберігає ваги з НАЙМЕНШИМ val loss
-    (якщо val немає — ваги останньої епохи).
-    Перевірка, що код учиться: train_head([room], epochs=200) — loss має впасти майже до 0."""
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     head = PlanarHead().to(device)
@@ -626,7 +522,7 @@ def train_head(train_rooms, val_rooms=None, epochs=20, lr=1e-3, weight_decay=1e-
             msg += f"  val loss={va.get('loss', 0):.4f}"
             score = va.get("loss", float("inf"))
         else:
-            score = -ep                                          # без val — остання епоха
+            score = -ep
         if save_path and score < best:
             best = score
             os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
@@ -636,12 +532,11 @@ def train_head(train_rooms, val_rooms=None, epochs=20, lr=1e-3, weight_decay=1e-
         print(msg)
 
     if save_path and os.path.exists(save_path):
-        head.load_state_dict(torch.load(save_path, map_location=device))   # повертаємо найкращу
+        head.load_state_dict(torch.load(save_path, map_location=device))
     return head, pd.DataFrame(history)
 
 
 def show_prediction(head, model, room, frame_idx=0):
-    """Фото / GT-класи / передбачені класи для одного кадру (0 інше, 1 стіна, 2 підлога, 3 стеля)."""
     import matplotlib.pyplot as plt
     names = data.room_frames(room)
     feat = extract_vggt_features(model, names)
@@ -664,7 +559,6 @@ def show_prediction(head, model, room, frame_idx=0):
 
 
 def load_head(ckpt_path=None, device="cuda", **kw):
-    """Створює PlanarHead і (за наявності) завантажує збережені ваги."""
     head = PlanarHead(**kw).to(device)
     if ckpt_path and os.path.exists(ckpt_path):
         head.load_state_dict(torch.load(ckpt_path, map_location=device))
