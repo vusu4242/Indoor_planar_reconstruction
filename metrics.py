@@ -1,12 +1,12 @@
 """
-Етап 6. Оцінювання.
+(6) Evaluation.
 
-Протокол:
-    - зіставлення площин з GT угорським алгоритмом за IoU (поріг 0.5);
-    - IoU рахується лише по пікселях, які GT вважає площинами
-      (дзеркала, двері в площині стіни тощо не карають);
-    - GT-площини менші за 0.5 % кадру не оцінюються;
-    - 3D-похибки (кут нормалі, відстань) — лише для зіставлених пар.
+    Protocol:
+    - matching planes with GT using the Hungarian algorithm based on IoU (threshold 0.5);
+    - IoU is calculated only over pixels that GT considers planes
+    (mirrors, doors within the wall plane, etc. are not penalized);
+    - GT planes smaller than 0.5% of the frame are ignored in evaluation;
+    - 3D errors (normal angle, distance) are computed only for matched pairs.
 """
 import numpy as np
 import pandas as pd
@@ -14,7 +14,7 @@ from scipy.optimize import linear_sum_assignment
 
 
 def evaluate(lab_full, planes, g, iou_thr=0.5, min_frac=0.005):
-    """Метрики одного кадру. lab_full — маска передбачених площин у розмірі GT."""
+    """Single-frame metrics. lab_full — predicted plane mask sized to match GT."""
     gm = g["mask"]
     known = gm > 0
     min_px = min_frac * gm.size
@@ -47,7 +47,7 @@ def evaluate(lab_full, planes, g, iou_thr=0.5, min_frac=0.005):
 
 
 def summarize(rows):
-    """Підсумок по всіх кадрах: precision/recall/F1 із сумарних TP/FP/FN."""
+    """Overall metrics across all frames: precision/recall/F1 computed from aggregated TP/FP/FN."""
     df = pd.DataFrame(rows)
     tp, fp, fn = df["TP"].sum(), df["FP"].sum(), df["FN"].sum()
     p, r = tp / max(tp + fp, 1), tp / max(tp + fn, 1)
@@ -60,8 +60,8 @@ def summarize(rows):
 
 
 def merge_consistency(items, gid):
-    """Якість злиття між кадрами за GT-ID стін.
-    items[i]["gt_id"] — ID GT-стіни, з якою зіставлено площину (або None); gid[i] — її група."""
+    """Cross-frame merging quality based on GT wall IDs.
+    items[i]["gt_id"] — ID of the GT wall matched to the plane (or None), gid[i] — its group ID."""
     seen, groups = {}, {}
     for i, it in enumerate(items):
         if it.get("gt_id") is not None:

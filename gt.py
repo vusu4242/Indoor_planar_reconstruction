@@ -1,24 +1,23 @@
 """
-Етап 2. Еталонна розмітка (GT).
-
-Площина: n·X + d = 0 у координатах камери (y вниз), нормаль дивиться в бік камери (d > 0).
-GT-маска містить лише пікселі, що справді лежать на площині за GT-глибиною:
-меблі, дзеркала та вид крізь вікна туди не потрапляють.
+(2) Ground Truth (GT) annotation
+    Plane: n * X + d = 0 in camera coordinates (y pointing downwards), 
+    with the normal facing towards the camera ($d > 0$).
+    The GT mask contains only pixels that truly lie on the plane according to GT depth:
+    furniture, mirrors, and views through windows are excluded.
 """
 import cv2
 import numpy as np
 
 from . import data
 
-# Кольори класів у семантиці (палітра NYU40)
-SEM_COLORS = {1: (174, 199, 232),   # стіна
-              2: (152, 223, 138),   # підлога
-              3: (78, 71, 183)}     # стеля
+SEM_COLORS = {1: (174, 199, 232),  
+              2: (152, 223, 138),  
+              3: (78, 71, 183)}    
 TYPE_ID = {"wall": 1, "floor": 2, "ceiling": 3}
 
 
 def plane_gt(f):
-    """Полігони з layout -> маска (0 = не площина, k = k-та площина) і список площин."""
+    """Layout polygons -> mask (0 = non-plane, k = k-th plane) and list of planes."""
     lay = f["layout"]
     h, w = f["rgb"].shape[:2]
     pts = [j["coordinate"] for j in lay["junctions"]]
@@ -37,7 +36,7 @@ def plane_gt(f):
 
 
 def semantic_classes(f):
-    """Семантика -> 0 інше, 1 стіна, 2 підлога, 3 стеля (знадобиться для голови)."""
+    """Semantics -> 0: other, 1: wall, 2: floor, 3: ceiling (needed for the head)."""
     cls = np.zeros(f["mask"].shape[:2], np.uint8)
     for k, c in SEM_COLORS.items():
         cls[np.all(f["mask"] == c, axis=-1)] = k
@@ -45,21 +44,22 @@ def semantic_classes(f):
 
 
 def plane_params(p):
-    """Площина з розмітки -> (n, d) у наших координатах, нормаль у бік камери (d > 0)."""
+    """Plane from annotation -> (n, d) in our coordinate system, with the normal facing towards the camera (d > 0)"""
     n = p["normal"].astype(np.float64).copy()
-    n[1] = -n[1]                                   # у розмітці y вгору, у нас вниз
+    n[1] = -n[1]                                   
     n /= np.linalg.norm(n)
     d = float(p["offset"])
     return (-n, -d) if d < 0 else (n, d)
 
 
 def gt_frame(f, tol_mm=20, tol_rel=0.01, use_semantic=False):
-    """Остаточний GT кадру: маска видимих площин, параметри площин, GT-точки.
-
-    use_semantic=False — піксель належить площині, якщо лежить на ній геометрично
-                         (жалюзі, рами, картини впритул до стіни теж рахуються стіною);
-    use_semantic=True  — ще й семантика має бути «стіна/підлога/стеля» відповідно
-                         до типу площини (вікна, жалюзі, двері, картини відкидаються)."""
+    """
+    Final frame GT: visible plane mask, plane parameters, GT points.
+    use_semantic=False — a pixel belongs to the plane if it lies on it geometrically
+    (blinds, frames, paintings flush against the wall are also counted as walls)
+    use_semantic=True — the semantics must additionally match "wall/floor/ceiling"
+    according to the plane type (windows, blinds, doors, paintings are filtered out).
+    """
     pmask, planes = plane_gt(f)
     P = data.backproject(f["depth"], f["cam"]["K"])
     valid = f["depth"] > 0

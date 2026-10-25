@@ -1,10 +1,12 @@
 """
-Етап 5. Агрегація площин:
-    clean_planes     — розбиття на зв'язні шматки, викидання дрібних;
-    merge_coplanar   — злиття шматків однієї площини всередині кадру;
-    filter_boundary  — залишаємо лише межі кімнати (за ними майже немає точок);
-    fill_holes       — closing масок наприкінці (геометрію не змінює);
-    merge_items      — злиття однакових площин між кадрами (у світових координатах).
+(5) Planes aggregation
+
+    clean_planes: splits into connected components and discards small fragments
+    merge_coplanar: merges coplanar fragments within the same frame
+    filter_boundary: keeps only room boundaries (filtering out planes with almost no points behind them)
+    fill_holes: morphological closing on masks at the end
+    merge_items: merges identical planes across multiple views (in world coordinates)
+
 """
 import cv2
 import numpy as np
@@ -14,9 +16,11 @@ from .ransac import fit_plane_pca
 
 
 def fill_holes(lab, k=5):
-    """Closing для кожної площини: заклеює дірки й щілини до розміру ядра k.
-    Заповнює лише пікселі, що не належать жодній площині (0), і НЕ перераховує площини,
-    тож на геометрію (нормалі, відстані) не впливає — змінюються лише маски."""
+    """
+    Morphological closing for each plane, k - kernel size.
+    Fills pixels that do not belong to any plane (background 0) and does not recompute plane parameters,
+    so geometry (normals, offsets) remains unaffected—only the masks are updated.
+    """
     out = lab.copy()
     kernel = np.ones((k, k), np.uint8)
     for lbl in np.unique(lab[lab > 0]):
@@ -26,7 +30,7 @@ def fill_holes(lab, k=5):
 
 
 def _union_find(n, pairs_ok):
-    """Групує елементи 0..n-1: i та j в одній групі, якщо pairs_ok(i, j) (транзитивно)."""
+    """Groups elements if pairs_ok(i, j)"""
     parent = list(range(n))
 
     def find(i):
@@ -42,7 +46,7 @@ def _union_find(n, pairs_ok):
 
 
 def _relabel(lab, groups_of_labels, P):
-    """Нова маска і площини з груп старих номерів (площини перераховуються через PCA)."""
+    """New mask and planes from old numbers (using PCA)"""
     out = np.zeros_like(lab)
     new = []
     for labels in groups_of_labels:
@@ -54,11 +58,12 @@ def _relabel(lab, groups_of_labels, P):
 
 
 def clean_planes(lab, planes, P, min_frac=0.005, open_k=3):
-    """Ділить кожну площину на зв'язні шматки, викидає дрібні, перераховує площини.
-
-    open_k — розмір ядра opening (прибирає шум, тонкі смужки й містки); 0 — вимкнено.
-    Розміри в пікселях маски VGGT (294×518): 3 тут ≈ 7 пікселів на повному кадрі 1280×720.
-    (Closing — окремо, в fill_holes, наприкінці пайплайну.)"""
+    """
+    Splits each plane into connected components, discards small fragments, and recalculates plane parameters
+    open_k — size of the opening kernel (removes noise, thin strips, and bridges), 0 — disabled
+    Sizes are in VGGT mask pixels (294×518): 3 here ~ 7 pixels on a full 1280×720 frame
+    (Closing is handled separately in fill_holes at the end of the pipeline.)
+    """
     h, w = lab.shape
     out = np.zeros_like(lab)
     new = []
@@ -78,7 +83,9 @@ def clean_planes(lab, planes, P, min_frac=0.005, open_k=3):
 
 
 def merge_coplanar(lab, planes, P, ang_thr=5, d_abs=60, d_rel=0.03):
-    """Зливає шматки однієї площини в межах кадру (однакові нормаль і відстань)."""
+    """
+    Merges coplanar fragments within the same frame (matching normal and offset).
+    """
     def ok(i, j):
         a, b = planes[i], planes[j]
         ang = np.degrees(np.arccos(np.clip(a["n"] @ b["n"], -1, 1)))
@@ -91,7 +98,7 @@ def merge_coplanar(lab, planes, P, ang_thr=5, d_abs=60, d_rel=0.03):
 
 
 def _plane_basis(n):
-    """Дві одиничні осі, що лежать у площині з нормаллю n."""
+    """Two unit axes lying in the plane with normal $n$."""
     a = np.array([1.0, 0, 0]) if abs(n[0]) < 0.9 else np.array([0, 1.0, 0])
     u = np.cross(n, a)
     u /= np.linalg.norm(u)
@@ -100,22 +107,22 @@ def _plane_basis(n):
 
 def filter_boundary(lab, planes, P, valid, max_behind=0.03, tol_mm=100, tol_rel=0.03,
                     behind_max_mm=None, footprint_margin_mm=None):
-    """Залишає лише площини, за якими майже немає точок кадру (межі кімнати).
+    """Retains only planes that have almost no frame points behind them (room boundaries).
 
-    behind_max_mm — рахувати лише точки, що лежать за площиною НЕ далі за це число мм.
-    footprint_margin_mm — рахувати лише точки, що лежать за площиною В МЕЖАХ самої площини
-        (плюс запас у мм). None — без цих обмежень."""
+    behind_max_mm — counts only points lying behind the plane no further than this value in mm.
+    footprint_margin_mm — counts only points lying behind the plane WITHIN the plane's footprint
+    (plus a margin in mm). None — disables these constraints."""
     X = P[valid]
     tol = np.maximum(tol_mm, tol_rel * X[:, 2])
     out = np.zeros_like(lab)
     kept = []
     for p in planes:
-        s = X @ p["n"] + p["d"]                              # відстань зі знаком (мінус = за площиною)
+        s = X @ p["n"] + p["d"]                            
         is_behind = s < -tol
         if behind_max_mm is not None:
             is_behind &= s > -behind_max_mm
         if footprint_margin_mm is not None and is_behind.any():
-            own = P[lab == p["label"]]                       # точки самої площини
+            own = P[lab == p["label"]]                      
             u, v = _plane_basis(p["n"])
             c = own.mean(0)
             ou, ov = (own - c) @ u, (own - c) @ v
@@ -124,11 +131,11 @@ def filter_boundary(lab, planes, P, valid, max_behind=0.03, tol_mm=100, tol_rel=
             m = footprint_margin_mm
             idx = np.flatnonzero(is_behind)
             B = X[idx] - c
-            bu, bv = B @ u, B @ v                            # проєкції точок «за площиною»
+            bu, bv = B @ u, B @ v                            
             inside = (bu > lo_u - m) & (bu < hi_u + m) & (bv > lo_v - m) & (bv < hi_v + m)
             is_behind = np.zeros_like(is_behind)
-            is_behind[idx[inside]] = True                    # лише ті, що прямо за площиною
-        behind = np.mean(is_behind)                          # частка точок за площиною
+            is_behind[idx[inside]] = True                    
+        behind = np.mean(is_behind)                          
         if behind <= max_behind:
             kept.append({**p, "label": len(kept) + 1, "behind": float(behind)})
             out[lab == p["label"]] = len(kept)
@@ -136,20 +143,20 @@ def filter_boundary(lab, planes, P, valid, max_behind=0.03, tol_mm=100, tol_rel=
 
 
 def same_plane(a, b, ang_thr=5, d_thr=100, touch_mm=200):
-    """Чи це та сама площина на різних кадрах (у світових координатах)."""
+    """Checks if this is the same plane across different frames (in world coordinates)."""
     na, nb, db = a["n"], b["n"], b["d"]
-    if na @ nb < 0:                                          # нормалі в різні боки -> вирівнюємо
+    if na @ nb < 0:                                        
         nb, db = -nb, -db
     if np.degrees(np.arccos(np.clip(na @ nb, -1, 1))) > ang_thr:
         return False
     if abs(a["d"] - db) > d_thr:
         return False
     dist, _ = cKDTree(b["pts"]).query(a["pts"], k=1)
-    return np.percentile(dist, 5) < touch_mm                 # точки двох площин торкаються
+    return np.percentile(dist, 5) < touch_mm                 
 
 
 def merge_items(items, **kw):
-    """Злиття площин між кадрами. Повертає номер групи (1, 2, ...) для кожної площини."""
+    """Merges planes across frames. Returns the group ID (1, 2, ...) for each plane."""
     roots = _union_find(len(items), lambda i, j: items[i]["frame"] != items[j]["frame"]
                         and same_plane(items[i], items[j], **kw))
     ids = {}
@@ -157,8 +164,9 @@ def merge_items(items, **kw):
 
 
 def to_world(planes, lab, P, R, t, max_pts=2000, seed=0):
-    """Площини кадру -> світові координати (для злиття між кадрами).
-    Камера: X_cam = R·X_world + t  =>  n_w = Rᵀn,  d_w = d + n·t,  X_world = Rᵀ(X_cam − t)."""
+    """Transforms frame planes to world coordinates (for cross-view merging).
+    Camera convention: 
+    X_cam = R·X_world + t  =>  n_w = Rᵀn,  d_w = d + n·t,  X_world = Rᵀ(X_cam − t)"""
     rng = np.random.default_rng(seed)
     out = []
     for p in planes:

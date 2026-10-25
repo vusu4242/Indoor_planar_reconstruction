@@ -89,7 +89,6 @@ def main():
         raise SystemExit("no rooms found: check --root and scene names")
     print(f"scenes: {len(scenes)}, rooms: {len(rooms)}")
 
-    # parameters shared by all configurations
     base = dict(conf_pct=args.conf_pct, scale_mode=args.scale_mode, gt_semantic=args.gt_semantic,
                 max_behind=args.max_behind, behind_max_mm=args.behind_max_mm,
                 open_k=args.open_k, close_k=args.close_k,
